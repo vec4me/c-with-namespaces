@@ -44,4 +44,5 @@ perl -0pe '
     s/^\s*export\s+//mg;
     s/extern "C"/extern/g;
     s/::/__/g;
-' "$source" | clang -I "$(dirname "$source")" -x c -std="$standard" -pedantic-errors -fsyntax-only -
+' "$source" \
+| clang -I "$(dirname "$source")" -x c -std="$standard" -pedantic-errors -Wno-implicit-function-declaration -fsyntax-only -

@@ -1,0 +1,305 @@
+module;
+
+#define _POSIX_C_SOURCE 200809L
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+#include <unistd.h>
+
+export module check;
+
+import input;
+import output;
+import parser;
+import rewrite;
+import source;
+
+namespace check {
+
+static bool already_written(char written[][512], size_t count, const char *path) {
+    size_t index = 0;
+
+    while (index < count) {
+        if (strcmp(written[index], path) == 0) {
+            return true;
+        }
+        index++;
+    }
+    return false;
+}
+
+static void remember_written(char written[][512], size_t *count, const char *path) {
+    if (*count >= 128) {
+        return;
+    }
+    strncpy(written[*count], path, 511);
+    written[*count][511] = '\0';
+    (*count)++;
+}
+
+static const char *skip_horizontal(const char *line) {
+    while (*line == ' ' || *line == '\t') {
+        line++;
+    }
+    return line;
+}
+
+static bool directive_at(const char *line, const char *name) {
+    line = skip_horizontal(line);
+    if (*line != '#') {
+        return false;
+    }
+    line++;
+    line = skip_horizontal(line);
+    return strncmp(line, name, strlen(name)) == 0 && (line[strlen(name)] == ' ' || line[strlen(name)] == '\t');
+}
+
+static bool continued_line(const char *line) {
+    size_t length = strlen(line);
+
+    while (length > 0 && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
+        length--;
+    }
+    return length > 0 && line[length - 1] == '\\';
+}
+
+static bool reserved_define(const char *line) {
+    line = skip_horizontal(line);
+    line++;
+    line = skip_horizontal(line);
+    line += strlen("define");
+    line = skip_horizontal(line);
+    return *line == '_';
+}
+
+static void write_prefix_defines(FILE *output, const char *path) {
+    FILE *input;
+    char line[1024];
+    bool keep;
+
+    input = fopen(path, "rb");
+    if (!input) {
+        fprintf(stderr, "c-with-namespaces: failed to open %s\n", path);
+        exit(1);
+    }
+
+    while (fgets(line, sizeof(line), input)) {
+        if (directive_at(line, "include")) {
+            break;
+        }
+        if (directive_at(line, "define")) {
+            keep = reserved_define(line);
+            if (keep) {
+                fputs(line, output);
+            }
+            while (continued_line(line) && fgets(line, sizeof(line), input)) {
+                if (keep) {
+                    fputs(line, output);
+                }
+            }
+        }
+    }
+
+    fclose(input);
+}
+
+static void write_all_prefix_defines(FILE *output, int count, char **paths) {
+    int index = 0;
+
+    while (index < count) {
+        write_prefix_defines(output, paths[index]);
+        index++;
+    }
+}
+
+static const char *base_name(const char *path) {
+    const char *slash;
+
+    slash = strrchr(path, '/');
+    if (!slash) {
+        return path;
+    }
+    return slash + 1;
+}
+
+static bool file_stem_matches(const char *path, const char *name) {
+    const char *base = base_name(path);
+    size_t index = 0;
+
+    while (base[index] != '\0' && base[index] != '.') {
+        if (base[index] != name[index]) {
+            return false;
+        }
+        index++;
+    }
+    return base[index] == '.' && name[index] == '\0';
+}
+
+static void require_file_namespace(source::Source *source) {
+    if (!file_stem_matches(source->path, source->namespace_name)) {
+        source::fail(source, "expected namespace to match file name");
+    }
+}
+
+static bool has_module_declaration(source::Source *source) {
+    size_t cursor = 0;
+    size_t export_length = strlen("export");
+    size_t next;
+    bool line_start = true;
+    char c;
+
+    while (cursor < source->length) {
+        if (line_start) {
+            while (cursor < source->length && source::horizontal_space(source::source_at(source, cursor))) {
+                cursor++;
+            }
+            if (source::source_keyword_at(source, cursor, "export")) {
+                next = cursor + export_length;
+                while (next < source->length && source::horizontal_space(source::source_at(source, next))) {
+                    next++;
+                }
+                if (source::source_keyword_at(source, next, "module")) {
+                    return true;
+                }
+            }
+        }
+
+        c = source::source_at(source, cursor++);
+        line_start = c == '\n';
+    }
+
+    return false;
+}
+
+static void parse_imports(source::Source *source) {
+    size_t start;
+
+    start = source->cursor;
+    while (parser::optional_import(source)) {
+        source::blank_range(source, start, source->cursor);
+        start = source->cursor;
+        parser::skip_blank_lines(source);
+        source::blank_range(source, start, source->cursor);
+        start = source->cursor;
+    }
+}
+
+static int lower_file(const char *path, FILE *output) {
+    source::Source source = {0};
+    size_t module;
+    size_t start;
+    size_t end;
+    size_t body;
+
+    source.path = path;
+    source.text = input::read_file(source.path, &source.length);
+    source.lowered = input::copy_text(source.text, source.length);
+
+    parser::skip_blank_lines(&source);
+    source::blank_range(&source, 0, source.cursor);
+
+    if (has_module_declaration(&source)) {
+        start = source.cursor;
+        parser::optional_module_fragment(&source);
+        source::blank_range(&source, start, source.cursor);
+        module = parser::find_export_module(&source);
+        source.cursor = module;
+
+        start = source.cursor;
+        parser::require_module(&source);
+        source::blank_range(&source, start, source.cursor);
+        start = source.cursor;
+        parser::skip_blank_lines(&source);
+        source::blank_range(&source, start, source.cursor);
+        parse_imports(&source);
+        start = source.cursor;
+        parser::require_namespace(&source);
+        require_file_namespace(&source);
+        source::blank_range(&source, start, source.cursor);
+
+        end = parser::find_namespace_close(&source);
+        source::blank_range(&source, end, source.length);
+        body = source.cursor;
+    } else {
+        parse_imports(&source);
+        end = source.length;
+        body = 0;
+    }
+
+    source.cursor = 0;
+    rewrite::rewrite_body(&source, end);
+    source.cursor = body;
+    output::write_lowered(output, &source, end);
+    free(source.lowered);
+    free(source.text);
+    return 0;
+}
+
+static int validate_c(const char *path, int argc, char **argv) {
+    char command[4096];
+    int length;
+    int index = 0;
+
+    length = snprintf(command, sizeof(command), "clang -x c -c %s -o /dev/null", path);
+    while (index < argc && length > 0 && (size_t)length < sizeof(command)) {
+        length += snprintf(command + length, sizeof(command) - (size_t)length, " %s", argv[index]);
+        index++;
+    }
+    return system(command);
+}
+
+export int run(int argc, char **argv) {
+    char temp_path[] = "/tmp/c-with-namespaces-XXXXXX";
+    FILE *output;
+    char written[128][512] = {0};
+    size_t written_count = 0;
+    int delimiter = argc;
+    int index = 0;
+    int fd;
+    int status;
+
+    while (index < argc) {
+        if (strcmp(argv[index], "--") == 0) {
+            delimiter = index;
+            break;
+        }
+        index++;
+    }
+    if (delimiter == 0) {
+        fprintf(stderr, "usage: c-with-namespaces --check <source>... -- <clang-arg>...\n");
+        return 1;
+    }
+
+    fd = mkstemp(temp_path);
+    if (fd < 0) {
+        fprintf(stderr, "c-with-namespaces: failed to create temporary path\n");
+        return 1;
+    }
+
+    output = fdopen(fd, "wb");
+    if (!output) {
+        fprintf(stderr, "c-with-namespaces: failed to open temporary output\n");
+        close(fd);
+        remove(temp_path);
+        return 1;
+    }
+
+    write_all_prefix_defines(output, delimiter, argv);
+
+    index = 0;
+    while (index < delimiter) {
+        if (!already_written(written, written_count, argv[index])) {
+            remember_written(written, &written_count, argv[index]);
+            lower_file(argv[index], output);
+        }
+        index++;
+    }
+    fclose(output);
+
+    status = validate_c(temp_path, argc - delimiter - 1, argv + delimiter + 1);
+    remove(temp_path);
+    return status == 0 ? 0 : 1;
+}
+
+}

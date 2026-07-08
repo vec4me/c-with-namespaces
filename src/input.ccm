@@ -1,0 +1,67 @@
+module;
+
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+export module input;
+
+import source;
+
+namespace input {
+
+export char *read_file(const char *path, size_t *length) {
+    FILE *file;
+    long size;
+    char *text;
+    size_t read;
+
+    file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to open input\n", path);
+        exit(1);
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to seek input\n", path);
+        fclose(file);
+        exit(1);
+    }
+    size = ftell(file);
+    if (size < 0) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to read input size\n", path);
+        fclose(file);
+        exit(1);
+    }
+    rewind(file);
+
+    text = (char *)calloc((size_t)size + 1, 1);
+    if (!text) {
+        fprintf(stderr, "c-with-namespaces: out of memory\n");
+        fclose(file);
+        exit(1);
+    }
+    read = fread(text, 1, (size_t)size, file);
+    if (read != (size_t)size) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to read input\n", path);
+        fclose(file);
+        free(text);
+        exit(1);
+    }
+    fclose(file);
+    *length = read;
+    return text;
+}
+
+export char *copy_text(char *text, size_t length) {
+    char *copy;
+
+    copy = (char *)calloc(length + 1, 1);
+    if (!copy) {
+        fprintf(stderr, "c-with-namespaces: out of memory\n");
+        exit(1);
+    }
+    memcpy(copy, text, length);
+    return copy;
+}
+
+}

@@ -1,0 +1,98 @@
+module;
+
+#include <ctype.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+#ifndef __cplusplus
+#define bool int
+#define true 1
+#define false 0
+#endif
+
+export module source;
+
+namespace source {
+
+#define IMPORT_LIMIT 64
+#define IMPORT_LENGTH 64
+#define NAMESPACE_LENGTH 64
+
+export typedef struct Source {
+    const char *path;
+    char *text;
+    char *lowered;
+    size_t length;
+    size_t cursor;
+    char namespace_name[NAMESPACE_LENGTH];
+    char imports[IMPORT_LIMIT][IMPORT_LENGTH];
+    size_t import_count;
+} Source;
+
+export void fail(Source *source, const char *message) {
+    fprintf(stderr, "c-with-namespaces: %s: %s\n", source->path, message);
+    exit(1);
+}
+
+export bool ident_start(char c) {
+    return isalpha((unsigned char)c) || c == '_';
+}
+
+export bool ident_char(char c) {
+    return isalnum((unsigned char)c) || c == '_';
+}
+
+export bool space_char(char c) {
+    return isspace((unsigned char)c);
+}
+
+export bool horizontal_space(char c) {
+    return c == ' ' || c == '\t';
+}
+
+export char text_at(const char *text, size_t length, size_t index) {
+    if (index >= length) {
+        return '\0';
+    }
+    return text[index];
+}
+
+export char source_at(Source *source, size_t index) {
+    return text_at(source->text, source->length, index);
+}
+
+export void blank_range(Source *source, size_t start, size_t end) {
+    while (start < end) {
+        if (source_at(source, start) == '\n') {
+            source->lowered[start] = '\n';
+        } else {
+            source->lowered[start] = ' ';
+        }
+        start++;
+    }
+}
+
+export bool keyword_at(const char *text, size_t length, size_t cursor, const char *keyword) {
+    size_t size = strlen(keyword);
+
+    if (cursor + size > length) {
+        return false;
+    }
+    if (strncmp(text + cursor, keyword, size) != 0) {
+        return false;
+    }
+    if (cursor > 0 && ident_char(text_at(text, length, cursor - 1))) {
+        return false;
+    }
+    if (cursor + size < length && ident_char(text_at(text, length, cursor + size))) {
+        return false;
+    }
+    return true;
+}
+
+export bool source_keyword_at(Source *source, size_t cursor, const char *keyword) {
+    return keyword_at(source->text, source->length, cursor, keyword);
+}
+
+}

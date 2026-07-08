@@ -1,0 +1,460 @@
+module;
+
+#include <stdio.h>
+#include <string.h>
+
+export module output;
+
+import source;
+
+namespace output {
+
+#define NAME_LIMIT 256
+#define NAME_LENGTH 64
+
+static bool exported_function_at(source::Source *source, size_t cursor, size_t end, size_t *signature, size_t *brace) {
+    bool has_paren = false;
+
+    cursor += strlen("export");
+    while (cursor < end && source::horizontal_space(source::source_at(source, cursor))) {
+        cursor++;
+    }
+    *signature = cursor;
+    while (cursor < end) {
+        char c = source::source_at(source, cursor);
+        if (c == '(') {
+            has_paren = true;
+        }
+        if (c == ';') {
+            return false;
+        }
+        if (c == '{') {
+            *brace = cursor;
+            return has_paren;
+        }
+        cursor++;
+    }
+    return false;
+}
+
+static void write_export_prototype(FILE *output, source::Source *source, size_t start, size_t end) {
+    while (start < end) {
+        fputc(source->lowered[start], output);
+        start++;
+    }
+    fputs(";\n", output);
+}
+
+static size_t line_number_at(source::Source *source, size_t cursor) {
+    size_t index = 0;
+    size_t line = 1;
+
+    while (index < cursor) {
+        if (source::source_at(source, index) == '\n') {
+            line++;
+        }
+        index++;
+    }
+    return line;
+}
+
+static bool keyword(const char *name) {
+    return strcmp(name, "auto") == 0 ||
+           strcmp(name, "break") == 0 ||
+           strcmp(name, "case") == 0 ||
+           strcmp(name, "char") == 0 ||
+           strcmp(name, "const") == 0 ||
+           strcmp(name, "continue") == 0 ||
+           strcmp(name, "default") == 0 ||
+           strcmp(name, "do") == 0 ||
+           strcmp(name, "double") == 0 ||
+           strcmp(name, "else") == 0 ||
+           strcmp(name, "enum") == 0 ||
+           strcmp(name, "extern") == 0 ||
+           strcmp(name, "float") == 0 ||
+           strcmp(name, "for") == 0 ||
+           strcmp(name, "goto") == 0 ||
+           strcmp(name, "if") == 0 ||
+           strcmp(name, "int") == 0 ||
+           strcmp(name, "long") == 0 ||
+           strcmp(name, "register") == 0 ||
+           strcmp(name, "return") == 0 ||
+           strcmp(name, "short") == 0 ||
+           strcmp(name, "signed") == 0 ||
+           strcmp(name, "sizeof") == 0 ||
+           strcmp(name, "static") == 0 ||
+           strcmp(name, "struct") == 0 ||
+           strcmp(name, "switch") == 0 ||
+           strcmp(name, "typedef") == 0 ||
+           strcmp(name, "union") == 0 ||
+           strcmp(name, "unsigned") == 0 ||
+           strcmp(name, "void") == 0 ||
+           strcmp(name, "volatile") == 0 ||
+           strcmp(name, "while") == 0 ||
+           strcmp(name, "bool") == 0 ||
+           strcmp(name, "FILE") == 0 ||
+           strcmp(name, "size_t") == 0;
+}
+
+static bool same_name(char names[][NAME_LENGTH], size_t count, const char *name) {
+    size_t index = 0;
+
+    while (index < count) {
+        if (strcmp(names[index], name) == 0) {
+            return true;
+        }
+        index++;
+    }
+    return false;
+}
+
+static void add_name(char names[][NAME_LENGTH], size_t *count, const char *name) {
+    if (*count >= NAME_LIMIT || name[0] == '_' || keyword(name) || same_name(names, *count, name)) {
+        return;
+    }
+    strncpy(names[*count], name, NAME_LENGTH - 1);
+    names[*count][NAME_LENGTH - 1] = '\0';
+    (*count)++;
+}
+
+static bool identifier_before(source::Source *source, size_t start, size_t cursor, char *name, size_t capacity) {
+    size_t end;
+    size_t index = 0;
+
+    while (cursor > start && !source::ident_char(source->lowered[cursor - 1])) {
+        cursor--;
+    }
+    end = cursor;
+    while (cursor > start && source::ident_char(source->lowered[cursor - 1])) {
+        cursor--;
+    }
+    if (cursor == end || !source::ident_start(source->lowered[cursor])) {
+        return false;
+    }
+    while (cursor < end && index + 1 < capacity) {
+        name[index] = source->lowered[cursor];
+        index++;
+        cursor++;
+    }
+    name[index] = '\0';
+    return true;
+}
+
+static void identifier_after(source::Source *source, size_t *cursor, size_t end, char *name, size_t capacity) {
+    size_t index = 0;
+
+    while (*cursor < end && !source::ident_start(source->lowered[*cursor])) {
+        (*cursor)++;
+    }
+    while (*cursor < end && source::ident_char(source->lowered[*cursor])) {
+        if (index + 1 < capacity) {
+            name[index] = source->lowered[*cursor];
+            index++;
+        }
+        (*cursor)++;
+    }
+    name[index] = '\0';
+}
+
+static void inspect_declaration(source::Source *source, size_t start, size_t end, char names[][NAME_LENGTH], size_t *count) {
+    size_t cursor = start;
+    size_t paren = end;
+    size_t equals = end;
+    size_t semicolon = end;
+    size_t bracket = end;
+    size_t brace = end;
+    char name[NAME_LENGTH];
+
+    while (cursor < end && source::horizontal_space(source->lowered[cursor])) {
+        cursor++;
+    }
+    if (cursor >= end || source->lowered[cursor] == '#') {
+        return;
+    }
+    if (source::keyword_at(source->lowered, source->length, cursor, "typedef")) {
+        while (cursor < end && source->lowered[cursor] != '{') {
+            cursor++;
+        }
+        if (identifier_before(source, start, cursor, name, sizeof(name))) {
+            add_name(names, count, name);
+        }
+        return;
+    }
+    if (source->lowered[cursor] == '}') {
+        identifier_after(source, &cursor, end, name, sizeof(name));
+        if (name[0] != '\0') {
+            add_name(names, count, name);
+        }
+        return;
+    }
+
+    cursor = start;
+    while (cursor < end) {
+        if (source->lowered[cursor] == '(' && paren == end) {
+            paren = cursor;
+        }
+        if (source->lowered[cursor] == '{' && brace == end) {
+            brace = cursor;
+        }
+        if (source->lowered[cursor] == '=' && equals == end) {
+            equals = cursor;
+        }
+        if (source->lowered[cursor] == ';' && semicolon == end) {
+            semicolon = cursor;
+        }
+        if (source->lowered[cursor] == '[' && bracket == end) {
+            bracket = cursor;
+        }
+        cursor++;
+    }
+    if (paren < equals && paren < semicolon && paren < brace && identifier_before(source, start, paren, name, sizeof(name))) {
+        add_name(names, count, name);
+        return;
+    }
+    cursor = equals < semicolon ? equals : semicolon;
+    cursor = bracket < cursor ? bracket : cursor;
+    if (cursor < end && identifier_before(source, start, cursor, name, sizeof(name))) {
+        add_name(names, count, name);
+    }
+}
+
+static void update_depth(source::Source *source, size_t start, size_t end, int *depth) {
+    size_t cursor = start;
+    char c;
+    char quote;
+
+    while (cursor < end) {
+        c = source->lowered[cursor];
+        if (c == '"' || c == '\'') {
+            quote = c;
+            cursor++;
+            while (cursor < end) {
+                c = source->lowered[cursor++];
+                if (c == '\\' && cursor < end) {
+                    cursor++;
+                    continue;
+                }
+                if (c == quote) {
+                    break;
+                }
+            }
+            continue;
+        }
+        if (c == '{') {
+            (*depth)++;
+        }
+        if (c == '}' && *depth > 0) {
+            (*depth)--;
+        }
+        cursor++;
+    }
+}
+
+static void collect_names(source::Source *source, size_t end, char names[][NAME_LENGTH], size_t *count) {
+    size_t cursor = source->cursor;
+    size_t line = cursor;
+    size_t start;
+    int depth = 0;
+    char c;
+
+    while (cursor < end) {
+        c = source->lowered[cursor++];
+        if (c == '{' || c == '\n' || cursor == end) {
+            start = line;
+            while (start < cursor && source::horizontal_space(source::source_at(source, start))) {
+                start++;
+            }
+            if (depth == 0 && source::source_keyword_at(source, start, "export")) {
+                inspect_declaration(source, line, cursor, names, count);
+            }
+            update_depth(source, line, cursor, &depth);
+            line = cursor;
+        }
+    }
+}
+
+static void collect_function_names(source::Source *source, size_t end, char names[][NAME_LENGTH], size_t *count) {
+    size_t cursor = source->cursor;
+    size_t start;
+    size_t paren;
+    size_t brace;
+    size_t semicolon;
+    int depth = 0;
+    char c;
+    char name[NAME_LENGTH];
+
+    while (cursor < end) {
+        start = cursor;
+        paren = end;
+        brace = end;
+        semicolon = end;
+        while (cursor < end) {
+            c = source->lowered[cursor];
+            if (c == '(' && paren == end) {
+                paren = cursor;
+            }
+            if (c == ';' && semicolon == end) {
+                semicolon = cursor;
+            }
+            if (c == '{') {
+                brace = cursor;
+                break;
+            }
+            if (c == '\n' && paren == end) {
+                start = cursor + 1;
+            }
+            cursor++;
+        }
+        if (brace >= end) {
+            return;
+        }
+        if (depth == 0 && paren < brace && semicolon > brace && identifier_before(source, start, paren, name, sizeof(name))) {
+            add_name(names, count, name);
+        }
+        update_depth(source, brace, brace + 1, &depth);
+        cursor = brace + 1;
+        while (cursor < end && depth > 0) {
+            start = cursor;
+            while (cursor < end && source->lowered[cursor] != '{' && source->lowered[cursor] != '}') {
+                cursor++;
+            }
+            update_depth(source, start, cursor + 1, &depth);
+            cursor++;
+        }
+    }
+}
+
+static void collect_enum_names(source::Source *source, size_t end, char names[][NAME_LENGTH], size_t *count) {
+    size_t cursor = source->cursor;
+    size_t start;
+    size_t index;
+    int depth = 0;
+    char name[NAME_LENGTH];
+
+    while (cursor < end) {
+        if (depth != 0) {
+            start = cursor;
+            while (cursor < end && source->lowered[cursor] != '{' && source->lowered[cursor] != '}') {
+                cursor++;
+            }
+            update_depth(source, start, cursor + 1, &depth);
+            cursor++;
+            continue;
+        }
+        while (cursor < end && !source::source_keyword_at(source, cursor, "export")) {
+            cursor++;
+        }
+        start = cursor;
+        while (cursor < end && source->lowered[cursor] != '{' && source->lowered[cursor] != ';') {
+            cursor++;
+        }
+        if (cursor >= end || source->lowered[cursor] == ';') {
+            continue;
+        }
+        while (start < cursor && !source::source_keyword_at(source, start, "enum")) {
+            start++;
+        }
+        if (start >= cursor) {
+            cursor++;
+            continue;
+        }
+
+        cursor++;
+        while (cursor < end) {
+            while (cursor < end && !source::ident_start(source->lowered[cursor]) && source->lowered[cursor] != '}') {
+                cursor++;
+            }
+            if (cursor >= end || source->lowered[cursor] == '}') {
+                break;
+            }
+            index = 0;
+            while (cursor < end && source::ident_char(source->lowered[cursor])) {
+                if (index + 1 < sizeof(name)) {
+                    name[index] = source->lowered[cursor];
+                    index++;
+                }
+                cursor++;
+            }
+            name[index] = '\0';
+            add_name(names, count, name);
+            while (cursor < end && source->lowered[cursor] != ',' && source->lowered[cursor] != '}') {
+                cursor++;
+            }
+            if (cursor < end && source->lowered[cursor] == ',') {
+                cursor++;
+            }
+        }
+        update_depth(source, cursor, cursor + 1, &depth);
+        if (cursor < end) {
+            cursor++;
+        }
+    }
+}
+
+static void write_namespace_defines(FILE *output, source::Source *source, char names[][NAME_LENGTH], size_t count) {
+    size_t index = 0;
+
+    if (source->namespace_name[0] == '\0') {
+        return;
+    }
+    while (index < count) {
+        fprintf(output, "#define %s %s__%s\n", names[index], source->namespace_name, names[index]);
+        index++;
+    }
+}
+
+static void write_namespace_undefs(FILE *output, char names[][NAME_LENGTH], size_t count) {
+    size_t index = 0;
+
+    while (index < count) {
+        fprintf(output, "#undef %s\n", names[index]);
+        index++;
+    }
+}
+
+static void write_body_with_prototypes(FILE *output, source::Source *source, size_t end) {
+    size_t cursor = source->cursor;
+    size_t written = 0;
+    size_t start;
+    size_t signature;
+    size_t brace;
+    bool line_start = true;
+    char c;
+
+    while (cursor < end) {
+        if (line_start) {
+            start = cursor;
+            while (cursor < end && source::horizontal_space(source::source_at(source, cursor))) {
+                cursor++;
+            }
+            if (source::source_keyword_at(source, cursor, "export") && exported_function_at(source, cursor, end, &signature, &brace)) {
+                fwrite(source->lowered + written, 1, start - written, output);
+                write_export_prototype(output, source, signature, brace);
+                fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, start), source->path);
+                written = start;
+            }
+        }
+
+        c = source::source_at(source, cursor++);
+        line_start = c == '\n';
+    }
+
+    fwrite(source->lowered + written, 1, source->length - written, output);
+}
+
+export void write_lowered(FILE *output, source::Source *source, size_t end) {
+    char names[NAME_LIMIT][NAME_LENGTH] = {0};
+    size_t count = 0;
+
+    collect_names(source, end, names, &count);
+    collect_function_names(source, end, names, &count);
+    collect_enum_names(source, end, names, &count);
+    fprintf(output, "#line 1 \"%s\"\n", source->path);
+    fwrite(source->lowered, 1, source->cursor, output);
+    write_namespace_defines(output, source, names, count);
+    fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, source->cursor), source->path);
+    write_body_with_prototypes(output, source, end);
+    write_namespace_undefs(output, names, count);
+}
+
+}

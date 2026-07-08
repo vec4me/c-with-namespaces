@@ -38,7 +38,7 @@ perl -0pe '
     s/extern "C"/extern/g;
     s/::/INTERNAL_SCOPE_RESOLUTION_OPERATOR/g;
 ' "$source" \
-| clang -x c -Wall -Wextra "${@:2}" -c -o /dev/null - 2>"$output"
+| clang -x c "${@:2}" -c -o /dev/null - 2>"$output"
 
 # Omit file-local import resolution diagnostics from lowered namespace references.
 perl -ne '

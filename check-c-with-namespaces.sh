@@ -1,5 +1,3 @@
-#!/usr/bin/env sh
-
 # Code validator for C with Namespaces.
 # C with Namespaces is C source wrapped in the small C++ surface we use for
 # modules, imports, exports, and namespace boundaries. This validator removes

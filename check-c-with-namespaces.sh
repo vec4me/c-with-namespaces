@@ -21,6 +21,7 @@
 # reports it. Namespaces are assumed to wrap the file body when present.
 
 source="$1"
+output="$(mktemp /tmp/check-c-with-namespaces.XXXXXX)"
 
 if [ ! -f "$source" ]; then
     echo "check-c-with-namespaces: expected source file as first argument" >&2
@@ -35,10 +36,48 @@ perl -0pe '
     s/\n\}\s*(?:\/\/[^\n]*)?\s*$/\n/s if $has_namespace;
     s/^\s*export\s+//mg;
     s/extern "C"/extern/g;
-    s/::/__/g;
+    s/::/INTERNAL_SCOPE_RESOLUTION_OPERATOR/g;
 ' "$source" \
-| clang \
-    -I "$(dirname "$source")" \
-    -x c \
-    "${@:2}" \
-    -
+| clang -x c -Wall -Wextra "${@:2}" -c -o /dev/null - 2>"$output"
+
+# Omit file-local import resolution diagnostics from lowered namespace references.
+perl -ne '
+    sub flush {
+        if (@block && !$skip) {
+            print @block;
+            $failed = 1 if $block[0] =~ /^<stdin>:\d+:\d+: (?:error|fatal error):/ || $block[0] =~ /^fatal error:/;
+        }
+        @block = ();
+        $skip = 0;
+    }
+
+    if (/^<stdin>:\d+:\d+: (?:error|warning|fatal error):/) {
+        flush();
+        @block = ($_);
+        $skip = /INTERNAL_SCOPE_RESOLUTION_OPERATOR/;
+        next;
+    }
+
+    if (/^\d+ warnings? and \d+ errors? generated\.$/) {
+        flush();
+        print if $failed;
+        next;
+    }
+
+    if (@block) {
+        push @block, $_;
+        $skip = 1 if /INTERNAL_SCOPE_RESOLUTION_OPERATOR/;
+        next;
+    }
+
+    print;
+
+    END {
+        flush();
+        exit $failed;
+    }
+' "$output" >&2
+
+status="$?"
+rm -f "$output"
+exit "$status"

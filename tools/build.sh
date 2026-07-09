@@ -5,9 +5,9 @@ sources=""
 build() {
     target="$1"
 
-    case " $sources " in
-        *" $target "*) return ;;
-    esac
+    if [ "${sources#*" $target "}" != "$sources" ]; then
+        return
+    fi
 
     for dependency in $(sed -n 's/^import \([^;]*\);/\1/p' "$target"); do
         if [ -e "src/$dependency.ccm" ]; then

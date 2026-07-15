@@ -9,33 +9,36 @@ module;
 
 export module check;
 
-import input;
+import arena;
 import output;
 import parser;
-import rewrite;
 import source;
 
 namespace check {
 
-static bool already_written(char written[][512], size_t count, const char *path) {
-    size_t index = 0;
+typedef struct check_options {
+    int delimiter;
+    int clang_count;
+    char **clang_arguments;
+    bool ignore_external;
+} check_options;
 
-    while (index < count) {
-        if (strcmp(written[index], path) == 0) {
+typedef struct checked_source {
+    source::source_file source;
+    const char *module;
+    size_t imports;
+} checked_source;
+
+static bool earlier_path(int index, char **paths) {
+    int earlier = 0;
+
+    while (earlier < index) {
+        if (strcmp(paths[earlier], paths[index]) == 0) {
             return true;
         }
-        index++;
+        earlier++;
     }
     return false;
-}
-
-static void remember_written(char written[][512], size_t *count, const char *path) {
-    if (*count >= 128) {
-        return;
-    }
-    strncpy(written[*count], path, 511);
-    written[*count][511] = '\0';
-    (*count)++;
 }
 
 static const char *skip_horizontal(const char *line) {
@@ -75,7 +78,8 @@ static bool reserved_define(const char *line) {
 
 static void write_prefix_defines(FILE *output, const char *path) {
     FILE *input;
-    char line[1024];
+    char *line = NULL;
+    size_t capacity = 0;
     bool keep;
 
     input = fopen(path, "rb");
@@ -84,7 +88,7 @@ static void write_prefix_defines(FILE *output, const char *path) {
         exit(1);
     }
 
-    while (fgets(line, sizeof(line), input)) {
+    while (getline(&line, &capacity, input) >= 0) {
         if (directive_at(line, "include")) {
             break;
         }
@@ -93,7 +97,7 @@ static void write_prefix_defines(FILE *output, const char *path) {
             if (keep) {
                 fputs(line, output);
             }
-            while (continued_line(line) && fgets(line, sizeof(line), input)) {
+            while (continued_line(line) && getline(&line, &capacity, input) >= 0) {
                 if (keep) {
                     fputs(line, output);
                 }
@@ -102,178 +106,367 @@ static void write_prefix_defines(FILE *output, const char *path) {
     }
 
     fclose(input);
+    free(line);
 }
 
-static void write_all_prefix_defines(FILE *output, int count, char **paths) {
+static bool check_option(const char *argument) {
+    return strcmp(argument, "--ignore-external") == 0;
+}
+
+static bool source_argument(int index, char **arguments) {
+    return !check_option(arguments[index]) && !earlier_path(index, arguments);
+}
+
+static check_options parse_options(int argc, char **argv) {
+    check_options options = {0};
     int index = 0;
 
-    while (index < count) {
-        write_prefix_defines(output, paths[index]);
-        index++;
-    }
-}
-
-static const char *base_name(const char *path) {
-    const char *slash;
-
-    slash = strrchr(path, '/');
-    if (!slash) {
-        return path;
-    }
-    return slash + 1;
-}
-
-static bool file_stem_matches(const char *path, const char *name) {
-    const char *base = base_name(path);
-    size_t index = 0;
-
-    while (base[index] != '\0' && base[index] != '.') {
-        if (base[index] != name[index]) {
-            return false;
+    options.delimiter = argc;
+    while (index < argc) {
+        if (strcmp(argv[index], "--") == 0) {
+            options.delimiter = index;
+            break;
+        }
+        if (check_option(argv[index])) {
+            options.ignore_external = true;
         }
         index++;
     }
-    return base[index] == '.' && name[index] == '\0';
-}
-
-static void require_file_namespace(source::Source *source) {
-    if (!file_stem_matches(source->path, source->namespace_name)) {
-        source::fail(source, "expected namespace to match file name");
+    if (options.delimiter < argc) {
+        options.clang_count = argc - options.delimiter - 1;
+        options.clang_arguments = argv + options.delimiter + 1;
     }
+    return options;
 }
 
-static bool has_module_declaration(source::Source *source) {
-    size_t cursor = 0;
-    size_t export_length = strlen("export");
+static char *read_file(const char *path, size_t *length, arena::arena *arena) {
+    FILE *file;
+    long size;
+    char *text;
+    size_t read;
+
+    file = fopen(path, "rb");
+    if (!file) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to open input\n", path);
+        exit(1);
+    }
+    if (fseek(file, 0, SEEK_END) != 0) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to seek input\n", path);
+        fclose(file);
+        exit(1);
+    }
+    size = ftell(file);
+    if (size < 0) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to read input size\n", path);
+        fclose(file);
+        exit(1);
+    }
+    rewind(file);
+    text = (char *)arena::allocate(arena, (size_t)size + 1);
+    read = fread(text, 1, (size_t)size, file);
+    if (read != (size_t)size) {
+        fprintf(stderr, "c-with-namespaces: %s: failed to read input\n", path);
+        fclose(file);
+        exit(1);
+    }
+    fclose(file);
+    *length = read;
+    return text;
+}
+
+static char *declaration_name(source::source_file *source, size_t start, size_t end, arena::arena *arena) {
+    char *name;
+
+    while (start < end && source::horizontal_space(source::source_at(source, start))) {
+        start++;
+    }
+    while (end > start && source::horizontal_space(source::source_at(source, end - 1))) {
+        end--;
+    }
+    name = (char *)arena::allocate(arena, end - start + 1);
+    memcpy(name, source->text + start, end - start);
+    return name;
+}
+
+static size_t declaration_end(source::source_file *source, size_t cursor) {
     size_t next;
-    bool line_start = true;
-    char c;
 
     while (cursor < source->length) {
-        if (line_start) {
-            while (cursor < source->length && source::horizontal_space(source::source_at(source, cursor))) {
-                cursor++;
-            }
-            if (source::source_keyword_at(source, cursor, "export")) {
-                next = cursor + export_length;
-                while (next < source->length && source::horizontal_space(source::source_at(source, next))) {
-                    next++;
-                }
-                if (source::source_keyword_at(source, next, "module")) {
-                    return true;
-                }
-            }
+        next = source::skip_ignored(source, cursor, source->length);
+        if (next != cursor) {
+            cursor = next;
+            continue;
         }
-
-        c = source::source_at(source, cursor++);
-        line_start = c == '\n';
+        if (source::source_at(source, cursor) == ';') {
+            return cursor;
+        }
+        cursor++;
     }
-
-    return false;
+    source::fail(source, "expected ; after module declaration");
+    return cursor;
 }
 
-static void parse_imports(source::Source *source) {
-    size_t start;
-
-    start = source->cursor;
-    while (parser::optional_import(source)) {
-        source::blank_range(source, start, source->cursor);
-        start = source->cursor;
-        parser::skip_blank_lines(source);
-        source::blank_range(source, start, source->cursor);
-        start = source->cursor;
-    }
-}
-
-static int lower_file(const char *path, FILE *output) {
-    source::Source source = {0};
-    size_t module;
-    size_t start;
+static size_t find_module_name(checked_source *checked, arena::arena *arena) {
+    source::source_file *source = &checked->source;
+    size_t cursor = 0;
+    size_t name;
+    size_t next;
     size_t end;
-    size_t body;
 
-    source.path = path;
-    source.text = input::read_file(source.path, &source.length);
-    source.lowered = input::copy_text(source.text, source.length);
-
-    parser::skip_blank_lines(&source);
-    source::blank_range(&source, 0, source.cursor);
-
-    if (has_module_declaration(&source)) {
-        start = source.cursor;
-        parser::optional_module_fragment(&source);
-        source::blank_range(&source, start, source.cursor);
-        module = parser::find_export_module(&source);
-        source.cursor = module;
-
-        start = source.cursor;
-        parser::require_module(&source);
-        source::blank_range(&source, start, source.cursor);
-        start = source.cursor;
-        parser::skip_blank_lines(&source);
-        source::blank_range(&source, start, source.cursor);
-        parse_imports(&source);
-        start = source.cursor;
-        parser::require_namespace(&source);
-        require_file_namespace(&source);
-        source::blank_range(&source, start, source.cursor);
-
-        end = parser::find_namespace_close(&source);
-        source::blank_range(&source, end, source.length);
-        body = source.cursor;
-    } else {
-        parse_imports(&source);
-        end = source.length;
-        body = 0;
+    while (cursor < source->length) {
+        cursor = source::skip_trivia(source, cursor, source->length);
+        if (!source::source_keyword_at(source, cursor, "export")) {
+            cursor++;
+            continue;
+        }
+        next = source::skip_trivia(source, cursor + strlen("export"), source->length);
+        if (!source::source_keyword_at(source, next, "module")) {
+            cursor++;
+            continue;
+        }
+        name = source::skip_trivia(source, next + strlen("module"), source->length);
+        end = declaration_end(source, name);
+        checked->module = declaration_name(source, name, end, arena);
+        return end + 1;
     }
-
-    source.cursor = 0;
-    rewrite::rewrite_body(&source, end);
-    source.cursor = body;
-    output::write_lowered(output, &source, end);
-    free(source.lowered);
-    free(source.text);
     return 0;
 }
 
-static int validate_c(const char *path, int argc, char **argv) {
-    char command[4096];
-    int length;
+static int module_source(const char *module, checked_source *sources, int count) {
     int index = 0;
 
-    length = snprintf(command, sizeof(command), "clang -x c -c %s -o /dev/null", path);
-    while (index < argc && length > 0 && (size_t)length < sizeof(command)) {
-        length += snprintf(command + length, sizeof(command) - (size_t)length, " %s", argv[index]);
+    while (index < count) {
+        if (sources[index].module && strcmp(sources[index].module, module) == 0) {
+            return index;
+        }
         index++;
     }
-    return system(command);
+    return -1;
+}
+
+static bool duplicate_modules(checked_source *sources, int count) {
+    int index = 0;
+    int other;
+
+    while (index < count) {
+        other = index + 1;
+        while (sources[index].module && other < count) {
+            if (sources[other].module && strcmp(sources[index].module, sources[other].module) == 0) {
+                fprintf(stderr, "c-with-namespaces: module %s is declared by both %s and %s\n",
+                        sources[index].module, sources[index].source.path, sources[other].source.path);
+                return true;
+            }
+            other++;
+        }
+        index++;
+    }
+    return false;
+}
+
+static void write_import_edges(FILE *graph, int index, checked_source *sources, int count, arena::arena *arena) {
+    source::source_file *source = &sources[index].source;
+    size_t cursor = sources[index].imports;
+    size_t name;
+    size_t end;
+    char *module;
+    int dependency;
+
+    cursor = source::skip_trivia(source, cursor, source->length);
+    while (source::source_keyword_at(source, cursor, "import")) {
+        name = source::skip_trivia(source, cursor + strlen("import"), source->length);
+        end = declaration_end(source, name);
+        module = declaration_name(source, name, end, arena);
+        dependency = module_source(module, sources, count);
+        if (dependency >= 0) {
+            fprintf(graph, "%d %d\n", dependency, index);
+        }
+        cursor = source::skip_trivia(source, end + 1, source->length);
+    }
+}
+
+static bool order_sources(checked_source *sources, int count, int *order, arena::arena *arena) {
+    char graph_path[] = "/tmp/c-with-namespaces-graph-XXXXXX";
+    char command[sizeof(graph_path) + sizeof("tsort ''")];
+    FILE *graph;
+    FILE *sorted;
+    int graph_fd;
+    int index = 0;
+    int status;
+
+    if (duplicate_modules(sources, count)) {
+        return false;
+    }
+    graph_fd = mkstemp(graph_path);
+    if (graph_fd < 0) {
+        fputs("c-with-namespaces: failed to create dependency graph\n", stderr);
+        return false;
+    }
+    graph = fdopen(graph_fd, "wb");
+    if (!graph) {
+        close(graph_fd);
+        remove(graph_path);
+        fputs("c-with-namespaces: failed to open dependency graph\n", stderr);
+        return false;
+    }
+    while (index < count) {
+        fprintf(graph, "%d %d\n", index, index);
+        write_import_edges(graph, index, sources, count, arena);
+        index++;
+    }
+    fclose(graph);
+    snprintf(command, sizeof(command), "tsort '%s'", graph_path);
+    sorted = popen(command, "r");
+    if (!sorted) {
+        remove(graph_path);
+        fputs("c-with-namespaces: failed to run tsort\n", stderr);
+        return false;
+    }
+    index = 0;
+    while (index < count && fscanf(sorted, "%d", &order[index]) == 1) {
+        index++;
+    }
+    status = pclose(sorted);
+    remove(graph_path);
+    if (status != 0 || index != count) {
+        fputs("c-with-namespaces: source dependency cycle\n", stderr);
+        return false;
+    }
+    return true;
+}
+
+static void lower_source(checked_source *checked, FILE *output, arena::arena *arena) {
+    size_t body;
+
+    checked->source.lowered = (char *)arena::copy(arena, checked->source.text, checked->source.length + 1);
+    body = parser::strip_preamble(&checked->source);
+    output::write_lowered(output, &checked->source, body, arena);
+}
+
+static bool external_diagnostic(const char *line) {
+    return strstr(line, "/include/") != NULL;
+}
+
+static void append_shell_word(char *command, size_t *length, const char *word) {
+    command[(*length)++] = ' ';
+    command[(*length)++] = '\'';
+    while (*word != '\0') {
+        if (*word == '\'') {
+            memcpy(command + *length, "'\\''", 4);
+            *length += 4;
+        } else {
+            command[(*length)++] = *word;
+        }
+        word++;
+    }
+    command[(*length)++] = '\'';
+    command[*length] = '\0';
+}
+
+static int validate_c(const char *path, int argc, char **argv, bool ignore_external) {
+    char *command;
+    char *line = NULL;
+    FILE *pipe;
+    size_t capacity = strlen("clang -x c -c -o /dev/null 2>&1") + strlen(path) * 4 + 4;
+    size_t line_capacity = 0;
+    size_t length;
+    int index = 0;
+    int status;
+    bool printed = false;
+    bool error = false;
+
+    while (index < argc) {
+        capacity += strlen(argv[index]) * 4 + 4;
+        index++;
+    }
+    command = (char *)calloc(capacity, 1);
+    if (!command) {
+        fprintf(stderr, "c-with-namespaces: out of memory\n");
+        return 1;
+    }
+    strcpy(command, "clang -x c -c");
+    length = strlen(command);
+    append_shell_word(command, &length, path);
+    memcpy(command + length, " -o /dev/null", strlen(" -o /dev/null") + 1);
+    length += strlen(" -o /dev/null");
+    index = 0;
+    while (index < argc) {
+        append_shell_word(command, &length, argv[index]);
+        index++;
+    }
+    if (!ignore_external) {
+        status = system(command);
+        free(command);
+        return status;
+    }
+    memcpy(command + length, " 2>&1", strlen(" 2>&1") + 1);
+
+    pipe = popen(command, "r");
+    if (!pipe) {
+        fprintf(stderr, "c-with-namespaces: failed to run clang\n");
+        free(command);
+        return 1;
+    }
+
+    while (getline(&line, &line_capacity, pipe) >= 0) {
+        if (external_diagnostic(line)) {
+            continue;
+        }
+        printed = true;
+        if (strstr(line, "error:")) {
+            error = true;
+        }
+        fputs(line, stderr);
+    }
+
+    status = pclose(pipe);
+    free(line);
+    free(command);
+    if (status == 0) {
+        return 0;
+    }
+    if (error || printed) {
+        return 1;
+    }
+    return 0;
 }
 
 export int run(int argc, char **argv) {
     char temp_path[] = "/tmp/c-with-namespaces-XXXXXX";
+    check_options options = parse_options(argc, argv);
+    arena::arena arena = {0};
+    checked_source *sources;
+    int *order;
     FILE *output;
-    char written[128][512] = {0};
-    size_t written_count = 0;
-    int delimiter = argc;
     int index = 0;
+    int source_count = 0;
     int fd;
     int status;
 
-    while (index < argc) {
-        if (strcmp(argv[index], "--") == 0) {
-            delimiter = index;
-            break;
+    sources = (checked_source *)arena::allocate(&arena, (size_t)options.delimiter * sizeof(*sources));
+    while (index < options.delimiter) {
+        if (source_argument(index, argv)) {
+            sources[source_count].source.path = argv[index];
+            sources[source_count].source.text = read_file(argv[index], &sources[source_count].source.length, &arena);
+            sources[source_count].imports = find_module_name(&sources[source_count], &arena);
+            source_count++;
         }
         index++;
     }
-    if (delimiter == 0) {
-        fprintf(stderr, "usage: c-with-namespaces --check <source>... -- <clang-arg>...\n");
+    if (source_count == 0) {
+        fprintf(stderr, "usage: c-with-namespaces check [--ignore-external] <source>... -- <clang-arg>...\n");
+        arena::destroy(&arena);
+        return 1;
+    }
+    order = (int *)arena::allocate(&arena, (size_t)source_count * sizeof(*order));
+    if (!order_sources(sources, source_count, order, &arena)) {
+        arena::destroy(&arena);
         return 1;
     }
 
     fd = mkstemp(temp_path);
     if (fd < 0) {
         fprintf(stderr, "c-with-namespaces: failed to create temporary path\n");
+        arena::destroy(&arena);
         return 1;
     }
 
@@ -282,23 +475,25 @@ export int run(int argc, char **argv) {
         fprintf(stderr, "c-with-namespaces: failed to open temporary output\n");
         close(fd);
         remove(temp_path);
+        arena::destroy(&arena);
         return 1;
     }
 
-    write_all_prefix_defines(output, delimiter, argv);
-
     index = 0;
-    while (index < delimiter) {
-        if (!already_written(written, written_count, argv[index])) {
-            remember_written(written, &written_count, argv[index]);
-            lower_file(argv[index], output);
-        }
+    while (index < source_count) {
+        write_prefix_defines(output, sources[order[index]].source.path);
+        index++;
+    }
+    index = 0;
+    while (index < source_count) {
+        lower_source(&sources[order[index]], output, &arena);
         index++;
     }
     fclose(output);
 
-    status = validate_c(temp_path, argc - delimiter - 1, argv + delimiter + 1);
+    status = validate_c(temp_path, options.clang_count, options.clang_arguments, options.ignore_external);
     remove(temp_path);
+    arena::destroy(&arena);
     return status == 0 ? 0 : 1;
 }
 

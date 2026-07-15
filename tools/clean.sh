@@ -1,1 +1,1 @@
-rm -rf build
+rm -r build

@@ -1,5 +1,7 @@
 # C with Namespaces
 
+## Motivation
+
 I wanted something resembling C because, more often than not, you can find good
 C programmers. That is less guaranteed with other languages, especially in a
 startup where onboarding will eventually matter. However, plain C is personally
@@ -24,17 +26,29 @@ The difference is that the tool doesn't actually compile anything: it is
 validation. It removes the C++20 module and namespace surface, then checks the
 remaining C.
 
-You can easily understand the constraints of the language by reading this
-codebase. Yes, this codebase was written in C with Namespaces. Files are
-namespaces, and you can refer to the tools as well to understand what is
-conventional for a C with Namespaces project.
+## Furthermore
 
 The validator requires supplying the whole set of code together, not individual
 sources or modules one at a time. Imports and namespaces are not really
 meaningful as one-off files, so the tool validates the connected set of files.
-The order must align with the source dependency order. The validator doesn't
-figure that out for you because your build tools should already encode it.
+Sources may be supplied in any order; the validator derives their dependency
+order from imports.
 
+Modules do not prescribe namespace names or require a namespace at all. A module
+may contain any number of named namespaces, and namespaces may be nested,
+reopened, or written using compact nested syntax:
+
+Namespace qualification is flattened by replacing each `::` with `__`.
+Consequently, `company::service::status` is checked as
+`company__service__status` in the lowered C. Whitespace and comments may appear
+between module, import, export, and namespace tokens.
+
+Here's an example usage:
 ```sh
-c-with-namespaces --check source.ccm main.cc -- -std=c99 -Wall -Wextra
+c-with-namespaces check gun.ccm character.ccm deathmatch.ccm main.cc -- -std=c89 -Wall -Wextra -pedantic
 ```
+
+## Rule of Thumb
+
+As long as the code is C apart from the namespace-related syntax, it
+is compliant.

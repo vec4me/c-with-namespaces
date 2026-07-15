@@ -8,233 +8,137 @@ import source;
 
 namespace parser {
 
-static void skip_space(source::Source *source) {
-    char c;
+typedef struct parser_state {
+    source::source_file *source;
+    size_t cursor;
+} parser_state;
 
-    while (source->cursor < source->length) {
-        c = source::source_at(source, source->cursor);
-        if (c != ' ' && c != '\t') {
-            break;
-        }
-        source->cursor++;
+static bool take_keyword(parser_state *parser, const char *keyword) {
+    if (!source::keyword_at(parser->source->text, parser->source->length, parser->cursor, keyword)) {
+        return false;
+    }
+    parser->cursor += strlen(keyword);
+    return true;
+}
+
+static void require_keyword(parser_state *parser, const char *keyword, const char *message) {
+    if (!take_keyword(parser, keyword)) {
+        source::fail(parser->source, message);
     }
 }
 
-static bool line_end(source::Source *source) {
-    char c;
+static void require_char(parser_state *parser, char expected, const char *message) {
+    parser->cursor = source::skip_trivia(parser->source, parser->cursor, parser->source->length);
+    if (source::source_at(parser->source, parser->cursor) != expected) {
+        source::fail(parser->source, message);
+    }
+    parser->cursor++;
+}
 
-    skip_space(source);
-    if (source->cursor >= source->length) {
-        return true;
-    }
-    c = source::source_at(source, source->cursor);
-    if (c == '\r') {
-        source->cursor++;
-        if (source->cursor < source->length && source::source_at(source, source->cursor) == '\n') {
-            source->cursor++;
+static void require_declaration_end(parser_state *parser, const char *message) {
+    char c;
+    size_t next;
+
+    while (parser->cursor < parser->source->length) {
+        next = source::skip_ignored(parser->source, parser->cursor, parser->source->length);
+        if (next != parser->cursor) {
+            parser->cursor = next;
+            continue;
         }
-        return true;
+        c = source::source_at(parser->source, parser->cursor++);
+        if (c == ';') {
+            return;
+        }
     }
-    if (c == '\n') {
-        source->cursor++;
-        return true;
+    source::fail(parser->source, message);
+}
+
+static bool optional_module_fragment(parser_state *parser) {
+    size_t start = parser->cursor;
+
+    parser->cursor = source::skip_trivia(parser->source, parser->cursor, parser->source->length);
+    if (!take_keyword(parser, "module")) {
+        parser->cursor = start;
+        return false;
+    }
+    require_char(parser, ';', "expected ; after module fragment");
+    return true;
+}
+
+static bool find_module(parser_state *parser, size_t *module) {
+    size_t cursor = parser->cursor;
+    size_t export_size = strlen("export");
+    size_t next;
+
+    while (cursor < parser->source->length) {
+        next = source::skip_ignored(parser->source, cursor, parser->source->length);
+        if (next != cursor) {
+            cursor = next;
+            continue;
+        }
+        if (source::source_keyword_at(parser->source, cursor, "export")) {
+            next = source::skip_trivia(parser->source, cursor + export_size, parser->source->length);
+            if (source::source_keyword_at(parser->source, next, "module")) {
+                *module = cursor;
+                return true;
+            }
+        }
+        cursor++;
     }
     return false;
 }
 
-export void skip_blank_lines(source::Source *source) {
+static void require_module(parser_state *parser) {
+    parser->cursor = source::skip_trivia(parser->source, parser->cursor, parser->source->length);
+    require_keyword(parser, "export", "expected export module declaration");
+    parser->cursor = source::skip_trivia(parser->source, parser->cursor, parser->source->length);
+    require_keyword(parser, "module", "expected module after export");
+    require_declaration_end(parser, "expected ; after module declaration");
+}
+
+static bool optional_import(parser_state *parser) {
+    size_t start = parser->cursor;
+
+    parser->cursor = source::skip_trivia(parser->source, parser->cursor, parser->source->length);
+    if (!take_keyword(parser, "import")) {
+        parser->cursor = start;
+        return false;
+    }
+    require_declaration_end(parser, "expected ; after import declaration");
+    return true;
+}
+
+static void strip_imports(parser_state *parser) {
+    size_t start = parser->cursor;
+
+    while (optional_import(parser)) {
+        source::blank_range(parser->source, start, parser->cursor);
+        start = parser->cursor;
+    }
+}
+
+export size_t strip_preamble(source::source_file *source) {
+    parser_state parser = {0};
+    size_t module;
     size_t start;
 
-    while (source->cursor < source->length) {
-        start = source->cursor;
-        if (!line_end(source)) {
-            source->cursor = start;
-            return;
-        }
-    }
-}
-
-static bool take_keyword(source::Source *source, const char *keyword) {
-    if (!source::keyword_at(source->text, source->length, source->cursor, keyword)) {
-        return false;
-    }
-    source->cursor += strlen(keyword);
-    return true;
-}
-
-static void require_keyword(source::Source *source, const char *keyword, const char *message) {
-    if (!take_keyword(source, keyword)) {
-        source::fail(source, message);
-    }
-}
-
-static void require_char(source::Source *source, char expected, const char *message) {
-    skip_space(source);
-    if (source::source_at(source, source->cursor) != expected) {
-        source::fail(source, message);
-    }
-    source->cursor++;
-}
-
-static void require_identifier(source::Source *source) {
-    char c;
-
-    skip_space(source);
-    c = source::source_at(source, source->cursor);
-    if (!source::ident_start(c)) {
-        source::fail(source, "expected identifier");
-    }
-    source->cursor++;
-    while (source->cursor < source->length && source::ident_char(source::source_at(source, source->cursor))) {
-        source->cursor++;
-    }
-}
-
-static void require_named_identifier(source::Source *source, char *name, size_t capacity) {
-    size_t index = 0;
-    char c;
-
-    skip_space(source);
-    c = source::source_at(source, source->cursor);
-    if (!source::ident_start(c)) {
-        source::fail(source, "expected identifier");
-    }
-    while (source->cursor < source->length && source::ident_char(source::source_at(source, source->cursor))) {
-        if (index + 1 < capacity) {
-            name[index] = source::source_at(source, source->cursor);
-            index++;
-        }
-        source->cursor++;
-    }
-    name[index] = '\0';
-}
-
-static void require_import_identifier(source::Source *source, char *name, size_t capacity) {
-    size_t index = 0;
-    char c;
-
-    skip_space(source);
-    c = source::source_at(source, source->cursor);
-    if (!source::ident_start(c)) {
-        source::fail(source, "expected identifier");
-    }
-    while (source->cursor < source->length && source::ident_char(source::source_at(source, source->cursor))) {
-        if (index + 1 < capacity) {
-            name[index] = source::source_at(source, source->cursor);
-            index++;
-        }
-        source->cursor++;
-    }
-    name[index] = '\0';
-}
-
-export bool optional_module_fragment(source::Source *source) {
-    size_t start = source->cursor;
-
-    skip_space(source);
-    if (!take_keyword(source, "module")) {
-        source->cursor = start;
-        return false;
-    }
-    require_char(source, ';', "expected ; after module fragment");
-    if (!line_end(source)) {
-        source::fail(source, "expected end of line after module fragment");
-    }
-    return true;
-}
-
-export size_t find_export_module(source::Source *source) {
-    size_t cursor = source->cursor;
-    size_t export_size = strlen("export");
-    size_t start;
-    size_t next;
-    bool line_start = true;
-    char c;
-
-    while (cursor < source->length) {
-        if (line_start) {
-            start = cursor;
-            while (cursor < source->length && source::horizontal_space(source::source_at(source, cursor))) {
-                cursor++;
-            }
-            if (source::source_keyword_at(source, cursor, "export")) {
-                next = cursor + export_size;
-                while (next < source->length && source::horizontal_space(source::source_at(source, next))) {
-                    next++;
-                }
-                if (source::source_keyword_at(source, next, "module")) {
-                    return start;
-                }
-            }
-        }
-
-        c = source::source_at(source, cursor++);
-        line_start = c == '\n';
+    parser.source = source;
+    parser.cursor = source::skip_trivia(source, parser.cursor, source->length);
+    source::blank_range(source, 0, parser.cursor);
+    if (!find_module(&parser, &module)) {
+        strip_imports(&parser);
+        return 0;
     }
 
-    source::fail(source, "expected export module declaration");
-    return 0;
-}
-
-export void require_module(source::Source *source) {
-    skip_space(source);
-    require_keyword(source, "export", "expected export module declaration");
-    skip_space(source);
-    require_keyword(source, "module", "expected module after export");
-    require_identifier(source);
-    require_char(source, ';', "expected ; after module declaration");
-    if (!line_end(source)) {
-        source::fail(source, "expected end of line after module declaration");
-    }
-}
-
-export bool optional_import(source::Source *source) {
-    size_t start = source->cursor;
-    char name[sizeof(source->imports[0])];
-
-    skip_space(source);
-    if (!take_keyword(source, "import")) {
-        source->cursor = start;
-        return false;
-    }
-    require_import_identifier(source, name, sizeof(name));
-    if (source->import_count < sizeof(source->imports) / sizeof(source->imports[0])) {
-        strcpy(source->imports[source->import_count], name);
-        source->import_count++;
-    }
-    require_char(source, ';', "expected ; after import declaration");
-    if (!line_end(source)) {
-        source::fail(source, "expected end of line after import declaration");
-    }
-    return true;
-}
-
-export void require_namespace(source::Source *source) {
-    skip_space(source);
-    if (take_keyword(source, "export")) {
-        skip_space(source);
-    }
-    require_keyword(source, "namespace", "expected namespace body");
-    require_named_identifier(source, source->namespace_name, sizeof(source->namespace_name));
-    require_char(source, '{', "expected { after namespace declaration");
-    if (!line_end(source)) {
-        source::fail(source, "expected end of line after namespace declaration");
-    }
-}
-
-export size_t find_namespace_close(source::Source *source) {
-    size_t cursor = source->length;
-
-    while (cursor > source->cursor && source::space_char(source::source_at(source, cursor - 1))) {
-        cursor--;
-    }
-    while (cursor > source->cursor && source::source_at(source, cursor - 1) != '}') {
-        cursor--;
-    }
-    if (cursor <= source->cursor) {
-        source::fail(source, "expected final namespace close");
-    }
-    return cursor - 1;
+    start = parser.cursor;
+    optional_module_fragment(&parser);
+    source::blank_range(source, start, parser.cursor);
+    parser.cursor = module;
+    start = parser.cursor;
+    require_module(&parser);
+    source::blank_range(source, start, parser.cursor);
+    strip_imports(&parser);
+    return parser.cursor;
 }
 
 }

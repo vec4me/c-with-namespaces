@@ -5,23 +5,134 @@ module;
 
 export module output;
 
+import arena;
 import source;
 
 namespace output {
 
-#define NAME_LIMIT 256
-#define NAME_LENGTH 64
+typedef struct name_table {
+    char **items;
+    size_t count;
+    size_t capacity;
+} name_table;
 
-static bool exported_function_at(source::Source *source, size_t cursor, size_t end, size_t *signature, size_t *brace) {
-    bool has_paren = false;
+typedef struct namespace_scope {
+    size_t declaration;
+    size_t body;
+    size_t end;
+    int parent;
+    char *path;
+    name_table names;
+    name_table path_names;
+} namespace_scope;
 
-    cursor += strlen("export");
-    while (cursor < end && source::horizontal_space(source::source_at(source, cursor))) {
+typedef struct namespace_tree {
+    namespace_scope *scopes;
+    size_t count;
+    size_t capacity;
+} namespace_tree;
+
+typedef struct int_stack {
+    int *items;
+    size_t count;
+    size_t capacity;
+} int_stack;
+
+static void *grow_array(arena::arena *storage, void *items, size_t count, size_t *capacity, size_t item_size) {
+    void *grown;
+
+    if (count < *capacity) {
+        return items;
+    }
+    *capacity = *capacity == 0 ? 16 : *capacity * 2;
+    grown = arena::allocate(storage, *capacity * item_size);
+    if (items) {
+        memcpy(grown, items, count * item_size);
+    }
+    return grown;
+}
+
+static void grow_tree(arena::arena *storage, namespace_tree *tree) {
+    tree->scopes = (namespace_scope *)grow_array(storage, tree->scopes, tree->count, &tree->capacity, sizeof(*tree->scopes));
+}
+
+static void push_int(arena::arena *storage, int_stack *stack, int value) {
+    stack->items = (int *)grow_array(storage, stack->items, stack->count, &stack->capacity, sizeof(*stack->items));
+    stack->items[stack->count++] = value;
+}
+
+static bool extern_c_at(source::source_file *source, size_t cursor, size_t end) {
+    size_t extern_size = strlen("extern");
+    size_t extern_c_size = strlen("extern \"C\"");
+
+    return source::source_keyword_at(source, cursor, "extern") &&
+           cursor + extern_c_size <= end &&
+           source::source_at(source, cursor + extern_size) == ' ' &&
+           source::source_at(source, cursor + extern_size + 1) == '"' &&
+           source::source_at(source, cursor + extern_size + 2) == 'C' &&
+           source::source_at(source, cursor + extern_size + 3) == '"';
+}
+
+static void skip_identifier(source::source_file *source, size_t *cursor, size_t end) {
+    while (*cursor < end && source::ident_char(source::source_at(source, *cursor))) {
+        (*cursor)++;
+    }
+}
+
+static void rewrite_body(source::source_file *source, size_t begin, size_t end) {
+    size_t export_size = strlen("export");
+    size_t extern_c_size = strlen("extern \"C\"");
+    size_t cursor = begin;
+    size_t next;
+    char c;
+
+    while (cursor < end) {
+        next = source::skip_ignored(source, cursor, end);
+        if (next != cursor) {
+            cursor = next;
+            continue;
+        }
+        c = source::source_at(source, cursor);
+        if (source::source_keyword_at(source, cursor, "export")) {
+            source::blank_range(source, cursor, cursor + export_size);
+            cursor += export_size;
+            continue;
+        }
+        if (extern_c_at(source, cursor, end)) {
+            source::blank_range(source, cursor, cursor + extern_c_size);
+            memcpy(source->lowered + cursor, "extern", strlen("extern"));
+            cursor += extern_c_size;
+            continue;
+        }
+        if (source::ident_start(c)) {
+            skip_identifier(source, &cursor, end);
+            while (cursor + 2 < end && source::source_at(source, cursor) == ':' && source::source_at(source, cursor + 1) == ':' && source::ident_start(source::source_at(source, cursor + 2))) {
+                source->lowered[cursor] = '_';
+                source->lowered[cursor + 1] = '_';
+                cursor += 2;
+                skip_identifier(source, &cursor, end);
+            }
+            continue;
+        }
         cursor++;
     }
+}
+
+static bool exported_function_at(source::source_file *source, size_t cursor, size_t end, size_t *signature, size_t *brace) {
+    bool has_paren = false;
+    size_t next;
+
+    cursor += strlen("export");
+    cursor = source::skip_trivia(source, cursor, end);
     *signature = cursor;
     while (cursor < end) {
         char c = source::source_at(source, cursor);
+
+        next = source::skip_ignored(source, cursor, end);
+        if (next != cursor) {
+            cursor = next;
+            continue;
+        }
         if (c == '(') {
             has_paren = true;
         }
@@ -37,7 +148,7 @@ static bool exported_function_at(source::Source *source, size_t cursor, size_t e
     return false;
 }
 
-static void write_export_prototype(FILE *output, source::Source *source, size_t start, size_t end) {
+static void write_export_prototype(FILE *output, source::source_file *source, size_t start, size_t end) {
     while (start < end) {
         fputc(source->lowered[start], output);
         start++;
@@ -45,7 +156,7 @@ static void write_export_prototype(FILE *output, source::Source *source, size_t 
     fputs(";\n", output);
 }
 
-static size_t line_number_at(source::Source *source, size_t cursor) {
+static size_t line_number_at(source::source_file *source, size_t cursor) {
     size_t index = 0;
     size_t line = 1;
 
@@ -96,11 +207,11 @@ static bool keyword(const char *name) {
            strcmp(name, "size_t") == 0;
 }
 
-static bool same_name(char names[][NAME_LENGTH], size_t count, const char *name) {
+static bool same_name(name_table *names, const char *name) {
     size_t index = 0;
 
-    while (index < count) {
-        if (strcmp(names[index], name) == 0) {
+    while (index < names->count) {
+        if (strcmp(names->items[index], name) == 0) {
             return true;
         }
         index++;
@@ -108,18 +219,19 @@ static bool same_name(char names[][NAME_LENGTH], size_t count, const char *name)
     return false;
 }
 
-static void add_name(char names[][NAME_LENGTH], size_t *count, const char *name) {
-    if (*count >= NAME_LIMIT || name[0] == '_' || keyword(name) || same_name(names, *count, name)) {
+static void add_name(arena::arena *storage, name_table *names, const char *name) {
+    if (name[0] == '_' || keyword(name) || same_name(names, name)) {
         return;
     }
-    strncpy(names[*count], name, NAME_LENGTH - 1);
-    names[*count][NAME_LENGTH - 1] = '\0';
-    (*count)++;
+    names->items = (char **)grow_array(storage, names->items, names->count, &names->capacity, sizeof(*names->items));
+    names->items[names->count] = (char *)arena::copy(storage, name, strlen(name) + 1);
+    names->count++;
 }
 
-static bool identifier_before(source::Source *source, size_t start, size_t cursor, char *name, size_t capacity) {
+static char *identifier_before(source::source_file *source, arena::arena *storage, size_t start, size_t cursor) {
     size_t end;
     size_t index = 0;
+    char *name;
 
     while (cursor > start && !source::ident_char(source->lowered[cursor - 1])) {
         cursor--;
@@ -129,41 +241,46 @@ static bool identifier_before(source::Source *source, size_t start, size_t curso
         cursor--;
     }
     if (cursor == end || !source::ident_start(source->lowered[cursor])) {
-        return false;
+        return NULL;
     }
-    while (cursor < end && index + 1 < capacity) {
+    name = (char *)arena::allocate(storage, end - cursor + 1);
+    while (cursor < end) {
         name[index] = source->lowered[cursor];
         index++;
         cursor++;
     }
     name[index] = '\0';
-    return true;
+    return name;
 }
 
-static void identifier_after(source::Source *source, size_t *cursor, size_t end, char *name, size_t capacity) {
+static char *identifier_after(source::source_file *source, arena::arena *storage, size_t *cursor, size_t end) {
+    size_t start;
     size_t index = 0;
+    char *name;
 
     while (*cursor < end && !source::ident_start(source->lowered[*cursor])) {
         (*cursor)++;
     }
+    start = *cursor;
     while (*cursor < end && source::ident_char(source->lowered[*cursor])) {
-        if (index + 1 < capacity) {
-            name[index] = source->lowered[*cursor];
-            index++;
-        }
         (*cursor)++;
     }
+    name = (char *)arena::allocate(storage, *cursor - start + 1);
+    while (start < *cursor) {
+        name[index++] = source->lowered[start++];
+    }
     name[index] = '\0';
+    return name;
 }
 
-static void inspect_declaration(source::Source *source, size_t start, size_t end, char names[][NAME_LENGTH], size_t *count) {
+static void inspect_declaration(source::source_file *source, arena::arena *storage, size_t start, size_t end, name_table *names) {
     size_t cursor = start;
     size_t paren = end;
     size_t equals = end;
     size_t semicolon = end;
     size_t bracket = end;
     size_t brace = end;
-    char name[NAME_LENGTH];
+    char *name;
 
     while (cursor < end && source::horizontal_space(source->lowered[cursor])) {
         cursor++;
@@ -175,15 +292,16 @@ static void inspect_declaration(source::Source *source, size_t start, size_t end
         while (cursor < end && source->lowered[cursor] != '{') {
             cursor++;
         }
-        if (identifier_before(source, start, cursor, name, sizeof(name))) {
-            add_name(names, count, name);
+        name = identifier_before(source, storage, start, cursor);
+        if (name) {
+            add_name(storage, names, name);
         }
         return;
     }
     if (source->lowered[cursor] == '}') {
-        identifier_after(source, &cursor, end, name, sizeof(name));
+        name = identifier_after(source, storage, &cursor, end);
         if (name[0] != '\0') {
-            add_name(names, count, name);
+            add_name(storage, names, name);
         }
         return;
     }
@@ -207,39 +325,35 @@ static void inspect_declaration(source::Source *source, size_t start, size_t end
         }
         cursor++;
     }
-    if (paren < equals && paren < semicolon && paren < brace && identifier_before(source, start, paren, name, sizeof(name))) {
-        add_name(names, count, name);
-        return;
+    if (paren < equals && paren < semicolon && paren < brace) {
+        name = identifier_before(source, storage, start, paren);
+        if (name) {
+            add_name(storage, names, name);
+            return;
+        }
     }
     cursor = equals < semicolon ? equals : semicolon;
     cursor = bracket < cursor ? bracket : cursor;
-    if (cursor < end && identifier_before(source, start, cursor, name, sizeof(name))) {
-        add_name(names, count, name);
+    if (cursor < end) {
+        name = identifier_before(source, storage, start, cursor);
+        if (name) {
+            add_name(storage, names, name);
+        }
     }
 }
 
-static void update_depth(source::Source *source, size_t start, size_t end, int *depth) {
+static void update_depth(source::source_file *source, size_t start, size_t end, int *depth) {
     size_t cursor = start;
+    size_t next;
     char c;
-    char quote;
 
     while (cursor < end) {
-        c = source->lowered[cursor];
-        if (c == '"' || c == '\'') {
-            quote = c;
-            cursor++;
-            while (cursor < end) {
-                c = source->lowered[cursor++];
-                if (c == '\\' && cursor < end) {
-                    cursor++;
-                    continue;
-                }
-                if (c == quote) {
-                    break;
-                }
-            }
+        next = source::skip_ignored(source, cursor, end);
+        if (next != cursor) {
+            cursor = next;
             continue;
         }
+        c = source->lowered[cursor];
         if (c == '{') {
             (*depth)++;
         }
@@ -250,11 +364,121 @@ static void update_depth(source::Source *source, size_t start, size_t end, int *
     }
 }
 
-static void collect_names(source::Source *source, size_t end, char names[][NAME_LENGTH], size_t *count) {
-    size_t cursor = source->cursor;
+static bool namespace_at(source::source_file *source, size_t cursor, size_t end, size_t *brace, char *name, size_t capacity) {
+    size_t index = 0;
+
+    if (!source::source_keyword_at(source, cursor, "namespace")) {
+        return false;
+    }
+    cursor += strlen("namespace");
+    cursor = source::skip_trivia(source, cursor, end);
+    if (cursor >= end || !source::ident_start(source::source_at(source, cursor))) {
+        return false;
+    }
+    while (cursor < end) {
+        while (cursor < end && source::ident_char(source::source_at(source, cursor))) {
+            if (index + 1 < capacity) {
+                name[index++] = source::source_at(source, cursor);
+            }
+            cursor++;
+        }
+        cursor = source::skip_trivia(source, cursor, end);
+        if (cursor + 2 >= end || source::source_at(source, cursor) != ':' || source::source_at(source, cursor + 1) != ':') {
+            break;
+        }
+        cursor += 2;
+        cursor = source::skip_trivia(source, cursor, end);
+        if (!source::ident_start(source::source_at(source, cursor))) {
+            return false;
+        }
+        if (index + 2 < capacity) {
+            name[index++] = '_';
+            name[index++] = '_';
+        }
+    }
+    name[index] = '\0';
+    cursor = source::skip_trivia(source, cursor, end);
+    if (cursor >= end || source::source_at(source, cursor) != '{') {
+        return false;
+    }
+    *brace = cursor;
+    return true;
+}
+
+static void set_scope_path(arena::arena *storage, namespace_scope *scope, namespace_scope *parent, const char *name) {
+    size_t name_length = strlen(name);
+    size_t path_length = strlen(parent->path);
+
+    scope->path = (char *)arena::allocate(storage, path_length + name_length + 3);
+    if (path_length == 0) {
+        strcpy(scope->path, name);
+    } else {
+        snprintf(scope->path, path_length + name_length + 3, "%s__%s", parent->path, name);
+    }
+}
+
+static void discover_namespaces(source::source_file *source, arena::arena *storage, size_t start, size_t end, namespace_tree *tree) {
+    int_stack braces = {0};
+    size_t cursor = start;
+    size_t brace;
+    int current = 0;
+    int scope;
+    size_t next;
+    char c;
+    char *name;
+
+    name = (char *)arena::allocate(storage, end - start + 1);
+
+    grow_tree(storage, tree);
+    tree->count = 1;
+    tree->scopes[0].body = start;
+    tree->scopes[0].end = end;
+    tree->scopes[0].path = (char *)"";
+
+    while (cursor < end) {
+        next = source::skip_ignored(source, cursor, end);
+        if (next != cursor) {
+            cursor = next;
+            continue;
+        }
+        c = source::source_at(source, cursor);
+        if (source::ident_start(c) && namespace_at(source, cursor, end, &brace, name, end - start + 1)) {
+            grow_tree(storage, tree);
+            scope = (int)tree->count++;
+            tree->scopes[scope].declaration = cursor;
+            tree->scopes[scope].body = brace + 1;
+            tree->scopes[scope].end = end;
+            tree->scopes[scope].parent = current;
+            set_scope_path(storage, &tree->scopes[scope], &tree->scopes[current], name);
+            push_int(storage, &braces, scope);
+            current = scope;
+            cursor = brace + 1;
+            continue;
+        }
+        if (c == '{') {
+            push_int(storage, &braces, -1);
+        } else if (c == '}' && braces.count > 0) {
+            scope = braces.items[--braces.count];
+            if (scope >= 0) {
+                tree->scopes[scope].end = cursor;
+                current = tree->scopes[scope].parent;
+            }
+        }
+        cursor++;
+    }
+
+    if (current != 0) {
+        source::fail(source, "expected namespace close");
+    }
+}
+
+static void collect_names(source::source_file *source, arena::arena *storage, size_t begin, size_t end, name_table *names) {
+    size_t cursor = begin;
     size_t line = cursor;
     size_t start;
+    size_t token;
     int depth = 0;
+    bool exported = false;
     char c;
 
     while (cursor < end) {
@@ -265,7 +489,18 @@ static void collect_names(source::Source *source, size_t end, char names[][NAME_
                 start++;
             }
             if (depth == 0 && source::source_keyword_at(source, start, "export")) {
-                inspect_declaration(source, line, cursor, names, count);
+                exported = true;
+            }
+            if (depth == 0 && exported) {
+                inspect_declaration(source, storage, line, cursor, names);
+                token = line;
+                while (token < cursor) {
+                    if (source->lowered[token] == '{' || source->lowered[token] == ';') {
+                        exported = false;
+                        break;
+                    }
+                    token++;
+                }
             }
             update_depth(source, line, cursor, &depth);
             line = cursor;
@@ -273,17 +508,61 @@ static void collect_names(source::Source *source, size_t end, char names[][NAME_
     }
 }
 
-static void collect_function_names(source::Source *source, size_t end, char names[][NAME_LENGTH], size_t *count) {
-    size_t cursor = source->cursor;
+static bool keyword_between(source::source_file *source, size_t start, size_t end, const char *keyword) {
+    while (start < end) {
+        if (source::source_keyword_at(source, start, keyword)) {
+            return true;
+        }
+        start++;
+    }
+    return false;
+}
+
+static void collect_enum_members(source::source_file *source, arena::arena *storage, size_t cursor, size_t end, name_table *names) {
+    size_t start;
+    size_t index;
+    char *name;
+
+    while (cursor < end && source->lowered[cursor] != '}') {
+        while (cursor < end && !source::ident_start(source->lowered[cursor]) && source->lowered[cursor] != '}') {
+            cursor++;
+        }
+        if (cursor >= end || source->lowered[cursor] == '}') {
+            return;
+        }
+        start = cursor;
+        while (cursor < end && source::ident_char(source->lowered[cursor])) {
+            cursor++;
+        }
+        name = (char *)arena::allocate(storage, cursor - start + 1);
+        index = 0;
+        while (start < cursor) {
+            name[index++] = source->lowered[start++];
+        }
+        name[index] = '\0';
+        add_name(storage, names, name);
+        while (cursor < end && source->lowered[cursor] != ',' && source->lowered[cursor] != '}') {
+            cursor++;
+        }
+        if (cursor < end && source->lowered[cursor] == ',') {
+            cursor++;
+        }
+    }
+}
+
+static void collect_definition_names(source::source_file *source, arena::arena *storage, size_t begin, size_t end, name_table *names) {
+    size_t cursor = begin;
+    size_t declaration;
     size_t start;
     size_t paren;
     size_t brace;
     size_t semicolon;
     int depth = 0;
     char c;
-    char name[NAME_LENGTH];
+    char *name;
 
     while (cursor < end) {
+        declaration = cursor;
         start = cursor;
         paren = end;
         brace = end;
@@ -308,8 +587,14 @@ static void collect_function_names(source::Source *source, size_t end, char name
         if (brace >= end) {
             return;
         }
-        if (depth == 0 && paren < brace && semicolon > brace && identifier_before(source, start, paren, name, sizeof(name))) {
-            add_name(names, count, name);
+        if (depth == 0 && paren < brace && semicolon > brace) {
+            name = identifier_before(source, storage, start, paren);
+            if (name) {
+                add_name(storage, names, name);
+            }
+        }
+        if (depth == 0 && keyword_between(source, declaration, brace, "export") && keyword_between(source, declaration, brace, "enum")) {
+            collect_enum_members(source, storage, brace + 1, end, names);
         }
         update_depth(source, brace, brace + 1, &depth);
         cursor = brace + 1;
@@ -324,137 +609,184 @@ static void collect_function_names(source::Source *source, size_t end, char name
     }
 }
 
-static void collect_enum_names(source::Source *source, size_t end, char names[][NAME_LENGTH], size_t *count) {
-    size_t cursor = source->cursor;
-    size_t start;
-    size_t index;
-    int depth = 0;
-    char name[NAME_LENGTH];
-
-    while (cursor < end) {
-        if (depth != 0) {
-            start = cursor;
-            while (cursor < end && source->lowered[cursor] != '{' && source->lowered[cursor] != '}') {
-                cursor++;
-            }
-            update_depth(source, start, cursor + 1, &depth);
-            cursor++;
-            continue;
-        }
-        while (cursor < end && !source::source_keyword_at(source, cursor, "export")) {
-            cursor++;
-        }
-        start = cursor;
-        while (cursor < end && source->lowered[cursor] != '{' && source->lowered[cursor] != ';') {
-            cursor++;
-        }
-        if (cursor >= end || source->lowered[cursor] == ';') {
-            continue;
-        }
-        while (start < cursor && !source::source_keyword_at(source, start, "enum")) {
-            start++;
-        }
-        if (start >= cursor) {
-            cursor++;
-            continue;
-        }
-
-        cursor++;
-        while (cursor < end) {
-            while (cursor < end && !source::ident_start(source->lowered[cursor]) && source->lowered[cursor] != '}') {
-                cursor++;
-            }
-            if (cursor >= end || source->lowered[cursor] == '}') {
-                break;
-            }
-            index = 0;
-            while (cursor < end && source::ident_char(source->lowered[cursor])) {
-                if (index + 1 < sizeof(name)) {
-                    name[index] = source->lowered[cursor];
-                    index++;
-                }
-                cursor++;
-            }
-            name[index] = '\0';
-            add_name(names, count, name);
-            while (cursor < end && source->lowered[cursor] != ',' && source->lowered[cursor] != '}') {
-                cursor++;
-            }
-            if (cursor < end && source->lowered[cursor] == ',') {
-                cursor++;
-            }
-        }
-        update_depth(source, cursor, cursor + 1, &depth);
-        if (cursor < end) {
-            cursor++;
-        }
-    }
-}
-
-static void write_namespace_defines(FILE *output, source::Source *source, char names[][NAME_LENGTH], size_t count) {
+static void write_namespace_defines(FILE *output, const char *path, name_table *names) {
     size_t index = 0;
 
-    if (source->namespace_name[0] == '\0') {
+    if (path[0] == '\0') {
         return;
     }
-    while (index < count) {
-        fprintf(output, "#define %s %s__%s\n", names[index], source->namespace_name, names[index]);
+    while (index < names->count) {
+        fprintf(output, "#undef %s\n", names->items[index]);
+        fprintf(output, "#define %s %s__%s\n", names->items[index], path, names->items[index]);
         index++;
     }
 }
 
-static void write_namespace_undefs(FILE *output, char names[][NAME_LENGTH], size_t count) {
+static void write_namespace_undefs(FILE *output, name_table *names) {
     size_t index = 0;
 
-    while (index < count) {
-        fprintf(output, "#undef %s\n", names[index]);
+    while (index < names->count) {
+        fprintf(output, "#undef %s\n", names->items[index]);
         index++;
     }
 }
 
-static void write_body_with_prototypes(FILE *output, source::Source *source, size_t end) {
-    size_t cursor = source->cursor;
-    size_t written = 0;
+static void write_body_with_prototypes(FILE *output, source::source_file *source, size_t begin, size_t end) {
+    size_t cursor = begin;
+    size_t written = begin;
     size_t start;
     size_t signature;
     size_t brace;
-    bool line_start = true;
-    char c;
+    size_t next;
 
     while (cursor < end) {
-        if (line_start) {
-            start = cursor;
-            while (cursor < end && source::horizontal_space(source::source_at(source, cursor))) {
-                cursor++;
-            }
-            if (source::source_keyword_at(source, cursor, "export") && exported_function_at(source, cursor, end, &signature, &brace)) {
-                fwrite(source->lowered + written, 1, start - written, output);
-                write_export_prototype(output, source, signature, brace);
-                fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, start), source->path);
-                written = start;
-            }
+        next = source::skip_ignored(source, cursor, end);
+        if (next != cursor) {
+            cursor = next;
+            continue;
         }
-
-        c = source::source_at(source, cursor++);
-        line_start = c == '\n';
+        start = cursor;
+        if (source::source_keyword_at(source, cursor, "export") && exported_function_at(source, cursor, end, &signature, &brace)) {
+            fwrite(source->lowered + written, 1, start - written, output);
+            write_export_prototype(output, source, signature, brace);
+            fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, start), source->path);
+            written = start;
+        }
+        cursor++;
     }
 
-    fwrite(source->lowered + written, 1, source->length - written, output);
+    fwrite(source->lowered + written, 1, end - written, output);
 }
 
-export void write_lowered(FILE *output, source::Source *source, size_t end) {
-    char names[NAME_LIMIT][NAME_LENGTH] = {0};
-    size_t count = 0;
+static void collect_scope_names(source::source_file *source, arena::arena *storage, namespace_scope *scope, name_table *names) {
+    collect_names(source, storage, scope->body, scope->end, names);
+    collect_definition_names(source, storage, scope->body, scope->end, names);
+}
 
-    collect_names(source, end, names, &count);
-    collect_function_names(source, end, names, &count);
-    collect_enum_names(source, end, names, &count);
+static void add_names(arena::arena *storage, name_table *destination, name_table *names) {
+    size_t index = 0;
+
+    while (index < names->count) {
+        add_name(storage, destination, names->items[index]);
+        index++;
+    }
+}
+
+static size_t earlier_scope(namespace_tree *tree, size_t index) {
+    size_t earlier = 0;
+
+    while (earlier < index && strcmp(tree->scopes[earlier].path, tree->scopes[index].path) != 0) {
+        earlier++;
+    }
+    return earlier;
+}
+
+static void build_path_names(arena::arena *storage, namespace_tree *tree) {
+    size_t index = 0;
+    size_t other;
+
+    while (index < tree->count) {
+        other = earlier_scope(tree, index);
+        if (other < index) {
+            tree->scopes[index].path_names = tree->scopes[other].path_names;
+            index++;
+            continue;
+        }
+        other = index;
+        while (other < tree->count) {
+            if (strcmp(tree->scopes[other].path, tree->scopes[index].path) == 0) {
+                add_names(storage, &tree->scopes[index].path_names, &tree->scopes[other].names);
+            }
+            other++;
+        }
+        index++;
+    }
+}
+
+static const char *relative_path(const char *parent, const char *path) {
+    size_t length = strlen(parent);
+
+    if (length == 0 || strncmp(path, parent, length) != 0 || path[length] != '_' || path[length + 1] != '_') {
+        return NULL;
+    }
+    return path + length + 2;
+}
+
+static void write_relative_macros(FILE *output, namespace_tree *tree, int scope_index, bool define) {
+    size_t index = 1;
+
+    if (tree->scopes[scope_index].path[0] == '\0') {
+        return;
+    }
+
+    while (index < tree->count) {
+        namespace_scope *scope = &tree->scopes[index];
+        namespace_scope *parent = &tree->scopes[scope_index];
+        size_t name_index = 0;
+        const char *relative;
+
+        relative = relative_path(parent->path, scope->path);
+        if ((int)index == scope_index || earlier_scope(tree, index) < index || !relative) {
+            index++;
+            continue;
+        }
+        while (name_index < scope->names.count) {
+            fprintf(output, "#undef %s__%s\n", relative, scope->names.items[name_index]);
+            if (define) {
+                fprintf(output, "#define %s__%s %s__%s\n", relative, scope->names.items[name_index], scope->path, scope->names.items[name_index]);
+            }
+            name_index++;
+        }
+        index++;
+    }
+}
+
+static void write_scope(FILE *output, source::source_file *source, namespace_tree *tree, int scope_index) {
+    namespace_scope *scope = &tree->scopes[scope_index];
+    name_table *names = &scope->path_names;
+    size_t cursor = scope->body;
+    size_t index = 1;
+
+    write_namespace_defines(output, scope->path, names);
+    write_relative_macros(output, tree, scope_index, true);
+
+    while (index < tree->count) {
+        namespace_scope *child = &tree->scopes[index];
+
+        if (child->parent != scope_index) {
+            index++;
+            continue;
+        }
+        write_body_with_prototypes(output, source, cursor, child->declaration);
+        fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, child->body), source->path);
+        write_scope(output, source, tree, (int)index);
+        write_namespace_defines(output, scope->path, names);
+        write_relative_macros(output, tree, scope_index, true);
+        cursor = child->end + 1;
+        index++;
+    }
+    write_body_with_prototypes(output, source, cursor, scope->end);
+    write_relative_macros(output, tree, scope_index, false);
+    write_namespace_undefs(output, names);
+}
+
+export void write_lowered(FILE *output, source::source_file *source, size_t body, arena::arena *storage) {
+    namespace_tree tree = {0};
+    size_t end = source->length;
+    size_t index = 0;
+
+    rewrite_body(source, 0, end);
+    discover_namespaces(source, storage, body, end, &tree);
+    while (index < tree.count) {
+        collect_scope_names(source, storage, &tree.scopes[index], &tree.scopes[index].names);
+        index++;
+    }
+    build_path_names(storage, &tree);
     fprintf(output, "#line 1 \"%s\"\n", source->path);
-    fwrite(source->lowered, 1, source->cursor, output);
-    write_namespace_defines(output, source, names, count);
-    fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, source->cursor), source->path);
-    write_body_with_prototypes(output, source, end);
-    write_namespace_undefs(output, names, count);
+    fwrite(source->lowered, 1, body, output);
+    fprintf(output, "#line %zu \"%s\"\n", line_number_at(source, body), source->path);
+    write_scope(output, source, &tree, 0);
+    fwrite(source->lowered + end, 1, source->length - end, output);
 }
 
 }

@@ -1,0 +1,81 @@
+module;
+
+#define BLOCK_SIZE 65536
+
+#include <stddef.h>
+#include <stdio.h>
+#include <stdlib.h>
+#include <string.h>
+
+export module arena;
+
+namespace arena {
+
+typedef union alignment {
+    void *pointer;
+    long double number;
+} alignment;
+
+typedef struct block {
+    struct block *next;
+    size_t capacity;
+    size_t used;
+} block;
+
+export typedef struct arena {
+    block *first;
+} arena;
+
+static size_t aligned_size(size_t size) {
+    size_t alignment = sizeof(alignment);
+    size_t remainder = size % alignment;
+
+    return remainder == 0 ? size : size + alignment - remainder;
+}
+
+export void *allocate(arena *arena, size_t size) {
+    block *current = arena->first;
+    size_t capacity;
+    size_t header_size;
+    void *memory;
+
+    size = aligned_size(size == 0 ? 1 : size);
+    if (!current || current->capacity - current->used < size) {
+        capacity = BLOCK_SIZE > size ? BLOCK_SIZE : size;
+        header_size = aligned_size(sizeof(*current));
+        current = (struct block *)malloc(header_size + capacity);
+        if (!current) {
+            fputs("c-with-namespaces: out of memory\n", stderr);
+            exit(1);
+        }
+        current->capacity = capacity;
+        current->used = 0;
+        current->next = arena->first;
+        arena->first = current;
+    }
+    memory = (unsigned char *)current + aligned_size(sizeof(*current)) + current->used;
+    current->used += size;
+    memset(memory, 0, size);
+    return memory;
+}
+
+export void *copy(arena *arena, const void *source, size_t size) {
+    void *destination = allocate(arena, size);
+
+    memcpy(destination, source, size);
+    return destination;
+}
+
+export void destroy(arena *arena) {
+    block *current = arena->first;
+
+    while (current) {
+        block *next = current->next;
+
+        free(current);
+        current = next;
+    }
+    arena->first = NULL;
+}
+
+}

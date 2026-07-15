@@ -1,38 +1,43 @@
 # C with Namespaces
 
+C with Namespaces is just a coding standard expressed in C++20, not a compiler,
+so don't go running away just yet.
+
 ## Motivation
 
-I wanted something resembling C because, more often than not, you can find good
-C programmers. That is less guaranteed with other languages, especially in a
-startup where onboarding will eventually matter. However, plain C is personally
-not readable enough to me because locality is, at worst, a choice, as opposed to
-compiler-enforced. That makes encapsulation harder to reason about. With C++
-namespaces, compliance is guaranteed.
+I wanted something resembling C because, more often than not, C programmers are
+better than programmers who use other languages. This is especially important
+in a startup, where conventionality, or the lack thereof, has a real cost.
+In my opinion, C is objectively flawed in a way that makes programming harder
+for any human: it lacks locality because it has no namespaces. Compensating for
+that flaw requires additional explicitness in the form of prefixes everywhere,
+which slows down code literacy and, in turn, slows down reasoning. Namespacing
+therefore becomes a discipline, while C++ namespaces turn that discipline into
+compiler-enforced locality.
 
 I went through many languages like Nim, D, and Nelua, and while I liked most of
-them, I realized there is more value in conventionality than I was initially
-understanding. Being as close to a C standard as possible is much better than
-making the language depend on some random compiler.
+them, I realized there is more value in conventionality than I initially
+understood. Code that lasts is also important to me, and that is more likely
+with a language present throughout today's software than with some random C++
+successor hidden like a needle in a haystack. Staying as close to standard C as
+possible avoids making the language depend on an obscure compiler.
 
-I explored deeply amongst the C and C++ languages how to have one type of file,
-and literally only C++20 modules were the solution. They are not amazing, but
-they are really the best thing we have, so each source file is a C++20 module.
-No header file for every source file either, which was one of my other dislikes.
-This essentially enforces what I consider a more legible version of C. Locality
-is key.
+So, what's the solution?
 
-Well Jeff, you're a hypocrite, because this still sounds like a random compiler.
-The difference is that the tool doesn't actually compile anything: it is
-validation. It removes the C++20 module and namespace surface, then checks the
-remaining C.
+It is not about finding the best successor to C/C++. It is about using what is
+already at our disposal in the most effective way and, I kid you not, that means
+C++20 modules. Remaining in the C ecosystem means no bindings, no foreign
+runtime, and no separate ecosystem to maintain. C++20 modules also mean no
+header file for every source file; we can use one type of file while enforcing
+what I consider a more legible version of C. While C++20 modules are not
+amazing, they are the best thing we have, which is why we use them.
 
-## Furthermore
+## So, How Does It Work?
 
-The validator requires supplying the whole set of code together, not individual
-sources or modules one at a time. Imports and namespaces are not really
-meaningful as one-off files, so the tool validates the connected set of files.
-Sources may be supplied in any order; the validator derives their dependency
-order from imports.
+Because imports and namespace references can cross file boundaries, validating
+a file in isolation would be incomplete. The tool therefore validates the
+supplied source set together. Sources may be supplied in any order; the
+validator derives their dependency order from imports.
 
 Modules do not prescribe namespace names or require a namespace at all. A module
 may contain any number of named namespaces, and namespaces may be nested,
@@ -43,7 +48,15 @@ Consequently, `company::service::status` is checked as
 `company__service__status` in the lowered C. Whitespace and comments may appear
 between module, import, export, and namespace tokens.
 
+## The Useful Part
+
+Everything after `--` is passed directly to Clang, so an explicit option such
+as `-std=c89` can enforce the C standard used for compliance. This effectively
+lets a project use C++ namespace syntax while enforcing compliance with any C
+standard supported by Clang.
+
 Here's an example usage:
+
 ```sh
 c-with-namespaces check gun.ccm character.ccm deathmatch.ccm main.cc -- -std=c89 -Wall -Wextra -pedantic
 ```
